@@ -78,8 +78,10 @@ def _process_case(f, image_dir, label_dir, output_dir, mod, channel, n_mod, y_sh
     # per-class signed distance maps for the boundary loss (computed on the padded label)
     phi = _sdf_volume(np.rint(label).astype(np.int16), num_fg)     # (K, D, H, W)
 
-    # channel order: 0=image, 1=label, 2..=phi_c ; float32 halves the disk vs float64
-    result = np.concatenate([image[None], label[None], phi], axis=0).astype(np.float32)
+    # channel order: 0=image, 1=label, 2..=phi_c. float16 (like thanasis) ~halves the disk vs
+    # float32 and is lossless enough here: label (0..N) is exact, image [0,1] loses ~0.001
+    # (imperceptible), and phi is a soft distance guide that is upcast to float32 in the loss.
+    result = np.concatenate([image[None], label[None], phi], axis=0).astype(np.float16)
     np.save(os.path.join(output_dir, f.split('.')[0] + '.npy'), result)
     return f
 
