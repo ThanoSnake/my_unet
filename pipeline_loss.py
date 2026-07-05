@@ -20,9 +20,12 @@
 #
 
 import contextlib
+import json
+import os
 import pickle
 import random
 from collections import defaultdict
+from multiprocessing import Pool
 
 import numpy as np
 import torch
@@ -30,7 +33,7 @@ import torch.nn.functional as F
 
 import config
 from datasets.two_dim.NumpyDataLoader_loss import NumpyDataSet
-from evaluation.evaluator import aggregate_scores, Evaluator
+from evaluation.evaluator import Evaluator
 
 
 def set_seed(seed):
@@ -158,9 +161,29 @@ def run_val_dice(model, loader, device, num_classes):
 
 
 #
-# test: full-slice inference per case -> Dice + ASSD (+ more) via the existing evaluator.
+# test: full-slice inference per case -> Dice + ASSD.
 #
-def evaluate_test(model, loader, device, json_path):
+# We compute ONLY Dice + ASSD (the two target metrics) and PARALLELISE the metric
+# computation across cases. The default evaluator also computes exact Hausdorff /
+# HD95 / ASD, and does it sequentially -- on full-resolution HepaticVessel (huge
+# vessel surface) that took *hours* for a single fold. Dice + ASSD, spread over the
+# CPU cores, brings it down to minutes. (Add more metrics here later if you want.)
+#
+_TEST_METRICS = ["Dice"]
+_TEST_ADVANCED = ["Avg. Symmetric Surface Distance"]
+
+
+def _eval_one(payload):
+    """Dice + ASSD for ONE (pred, gt) case. Module-level so multiprocessing can pickle it."""
+    pred, gt, labels = payload
+    ev = Evaluator(labels=labels, metrics=list(_TEST_METRICS), advanced_metrics=list(_TEST_ADVANCED))
+    ev.set_test(pred)
+    ev.set_reference(gt)
+    res = ev.evaluate(advanced=True)
+    return {lab: {m: float(v) for m, v in md.items()} for lab, md in res.items()}
+
+
+def evaluate_test(model, loader, device, json_path, metric_workers=None):
     model.eval()
     # accumulate per-case pred/GT as uint8 (labels are small ints) to keep RAM bounded on large CT
     pred_dict, gt_dict = defaultdict(list), defaultdict(list)
@@ -172,8 +195,27 @@ def evaluate_test(model, loader, device, json_path):
             for i, fname in enumerate(batch["fnames"]):
                 pred_dict[fname[0]].append(pred[i])
                 gt_dict[fname[0]].append(target[i])
-    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]   # each [Z, H, W]
-    scores = aggregate_scores(pairs, evaluator=Evaluator, labels=config.LABELS,
-                              json_output_file=json_path, json_author="cv-project",
-                              json_task=config.TASK, advanced=True)
-    return scores
+    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k]), config.LABELS) for k in pred_dict]  # each [Z,H,W]
+
+    # metric computation is the bottleneck on full-res vessels -> parallelise across cases
+    nproc = min(len(pairs), metric_workers or (os.cpu_count() or 1)) if pairs else 1
+    print(f"[eval] {len(pairs)} test cases -> Dice + ASSD on {nproc} process(es)", flush=True)
+    if nproc > 1:
+        with Pool(nproc) as pool:
+            per_case = pool.map(_eval_one, pairs)
+    else:
+        per_case = [_eval_one(p) for p in pairs]
+
+    # aggregate (nanmean over cases), matching the JSON the existing tools read
+    acc = {}
+    for case in per_case:
+        for lab, md in case.items():
+            acc.setdefault(lab, {})
+            for m, v in md.items():
+                acc[lab].setdefault(m, []).append(v)
+    mean = {lab: {m: float(np.nanmean(vs)) for m, vs in md.items()} for lab, md in acc.items()}
+
+    out = {"task": config.TASK, "results": {"all": per_case, "mean": mean}}
+    with open(json_path, "w") as f:
+        json.dump(out, f, indent=2)
+    return {"mean": mean}

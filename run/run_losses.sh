@@ -68,9 +68,11 @@ run() {   # run() "label" cmd... : header + timing, CONTINUE on failure (overnig
 # ---- 1. clone (or update) the repo on the 'losses' branch ----
 REPO_DIR="$WORKDIR/repo"
 if [ -d "$REPO_DIR/.git" ]; then
-    echo "repo present -> updating branch $BRANCH"
-    git -C "$REPO_DIR" checkout "$BRANCH" 2>/dev/null || true
-    git -C "$REPO_DIR" pull --ff-only 2>/dev/null || echo "WARN: could not update; using existing checkout"
+    echo "repo present -> force-updating to origin/$BRANCH (tracked code only; data/ & results/ untouched)"
+    git -C "$REPO_DIR" fetch origin "$BRANCH" \
+        && git -C "$REPO_DIR" checkout "$BRANCH" \
+        && git -C "$REPO_DIR" reset --hard FETCH_HEAD \
+        || echo "WARN: could not update; using existing checkout"
 else
     git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$REPO_DIR" \
         || { echo "git clone of branch '$BRANCH' failed -> aborting"; exit 1; }
@@ -118,22 +120,37 @@ else
     have_prep || { echo "PREPROCESS did not produce >=4-channel npy -> aborting"; exit 1; }
 fi
 
-# ---- 5. train + test each loss combo on each fold ----
+# ---- 5. TRAIN all combos first (so a slow test can never block the training) ----
+#         skip-if-exists makes re-runs idempotent (already-trained combos are not redone).
 for FOLD in $FOLDS; do
   for LOSS in $LOSSES; do
-    run "train $LOSS fold$FOLD" python3 train_losses.py --loss "$LOSS" --fold "$FOLD" \
-        --epochs "$EPOCHS" --patience "$PATIENCE" --iters-per-epoch "$ITERS" \
-        --patch-size "$PATCH" --batch-size "$BATCH" --val-every "$VAL_EVERY" \
-        --val-cases "$VAL_CASES" --val-batch "$VAL_BATCH" --fg-fraction "$FG_FRACTION" \
-        --num-workers "$WORKERS" --tversky-alpha "$TV_A" --tversky-beta "$TV_B" \
-        --focal-gamma "$FOCAL_G" --boundary-max "$B_MAX" --boundary-warmup "$B_WARM" \
-        --cldice-weight "$CL_W" --cldice-iters "$CL_IT" --out-dir results
-    run "test $LOSS fold$FOLD" python3 test_losses.py --tag "$LOSS" --fold "$FOLD" \
-        --num-workers "$WORKERS" --out-dir results
+    if [ -f "results/${LOSS}_f${FOLD}_best.pth" ]; then
+        echo "===== skip train $LOSS fold$FOLD (best.pth already exists) ====="
+    else
+        run "train $LOSS fold$FOLD" python3 train_losses.py --loss "$LOSS" --fold "$FOLD" \
+            --epochs "$EPOCHS" --patience "$PATIENCE" --iters-per-epoch "$ITERS" \
+            --patch-size "$PATCH" --batch-size "$BATCH" --val-every "$VAL_EVERY" \
+            --val-cases "$VAL_CASES" --val-batch "$VAL_BATCH" --fg-fraction "$FG_FRACTION" \
+            --num-workers "$WORKERS" --tversky-alpha "$TV_A" --tversky-beta "$TV_B" \
+            --focal-gamma "$FOCAL_G" --boundary-max "$B_MAX" --boundary-warmup "$B_WARM" \
+            --cldice-weight "$CL_W" --cldice-iters "$CL_IT" --out-dir results
+    fi
   done
 done
 
-# ---- 6. aggregate + compare (Dice / ASSD per class, delta vs the dice_ce baseline) ----
+# ---- 6. TEST all combos (fast: Dice + ASSD only, parallel across cases) ----
+for FOLD in $FOLDS; do
+  for LOSS in $LOSSES; do
+    if [ -f "results/${LOSS}_f${FOLD}_scores.json" ]; then
+        echo "===== skip test $LOSS fold$FOLD (scores.json already exists) ====="
+    else
+        run "test $LOSS fold$FOLD" python3 test_losses.py --tag "$LOSS" --fold "$FOLD" \
+            --num-workers "$WORKERS" --out-dir results
+    fi
+  done
+done
+
+# ---- 7. aggregate + compare (Dice / ASSD per class, delta vs the dice_ce baseline) ----
 for LOSS in $LOSSES; do
     run "fold-mean $LOSS" python3 train_eval.py --fold-mean "$LOSS"
 done
