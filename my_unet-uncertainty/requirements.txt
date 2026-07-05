@@ -1,0 +1,11 @@
+torch
+numpy
+
+medpy
+nibabel
+SimpleITK
+batchgenerators==0.21
+scipy
+scikit-image
+
+pandas
