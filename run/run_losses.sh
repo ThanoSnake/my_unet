@@ -99,7 +99,8 @@ SPLITS="$DATA_DIR/splits.pkl"
 
 have_prep() {   # true only if splits + a >=4-channel npy exist (image+label+2 SDF for HepaticVessel)
     [ -f "$SPLITS" ] || return 1
-    local f; f=$(ls "$PREP_DIR"/*.npy 2>/dev/null | head -1) || return 1
+    local f                                    # find -print -quit: first match, no pipe (robust under pipefail)
+    f=$(find "$PREP_DIR" -maxdepth 1 -name '*.npy' -print -quit 2>/dev/null)
     [ -n "$f" ] || return 1
     python3 - "$f" <<'PY'
 import sys, numpy as np
