@@ -46,13 +46,18 @@ def build_plain_loaders_spleen(args):
     data_dir = str(config.PREPROCESSED_DIR)
     margin = getattr(args, "fg_margin", 3)
     common = dict(target_size=args.patch_size, batch_size=args.batch_size,
-                  input_slice=(0,), label_slice=1, num_processes=args.num_workers)
+                  input_slice=(0,), label_slice=1)
 
-    # train: keep organ-bearing slices (+margin neighbours) -> class balance
-    train = NumpyDataSetSpleen(data_dir, keys=tr, foreground_only=True, margin=margin, **common)
-    # val / test: every slice, for honest volume-level scoring
-    val = NumpyDataSet(data_dir, keys=vl, mode="val", do_reshuffle=False, **common)
-    test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False, **common)
+    # Workers ONLY for train (the expensive elastic augmentation). val/test run
+    # single-process on purpose: their augmentation is trivial (a resize), so 0 costs
+    # almost nothing -- AND it avoids spinning up a SECOND pool of forked workers next
+    # to the training pool once CUDA is live, which aborts the workers (SIGABRT) on a
+    # DL VM. That second (val) pool is exactly what crashed with num_workers>0 while the
+    # identical train pool had just run a full epoch fine.
+    train = NumpyDataSetSpleen(data_dir, keys=tr, foreground_only=True, margin=margin,
+                               num_processes=args.num_workers, **common)   # train: fg-filtered, parallel
+    val = NumpyDataSet(data_dir, keys=vl, mode="val", do_reshuffle=False, num_processes=0, **common)
+    test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False, num_processes=0, **common)
     in_channels = 1
     return train, val, test, in_channels
 

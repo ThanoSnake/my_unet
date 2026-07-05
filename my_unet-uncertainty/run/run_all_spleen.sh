@@ -35,7 +35,9 @@ FOLDS="0"                                   # "0" tonight; "0 1 2 3 4" for full 
 SIZE=256                  # preprocessing in-plane size (baked into the npy)
 PATCH=256                 # train/eval slice size (must be <= SIZE)
 BATCH=8                   # 256x256 fits batch 8 on an L4 (bf16); try 12/16 if no OOM, 4 if OOM
-WORKERS=8                 # data-loading processes; set 0 if you ever hit a CUDA-fork error
+WORKERS="${WORKERS:-8}"   # workers for the (expensive) TRAIN augmentation only; val/test run
+                          # single-process, so a second forked pool never aborts CUDA. If the
+                          # TRAIN pool itself ever aborts workers, drop to WORKERS=0.
 EPOCHS=150
 PATIENCE=12
 DROPOUT=0.4
