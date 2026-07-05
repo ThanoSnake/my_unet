@@ -1,148 +1,179 @@
 #!/usr/bin/env bash
 #
-# End-to-end Spleen (Task09) MC-Dropout + calibration pipeline for a GCP
-# Deep-Learning VM (L4, 24 GB).
+# Self-contained overnight MC-Dropout UNCERTAINTY + CALIBRATION experiment on
+# Task09 Spleen (GPU VM, e.g. L4 24GB).
 #
-# RECOMMENDED USAGE (bootstrap): copy just this file to the VM home and run it:
-#     bash run_all_spleen.sh
-# The FIRST run clones the repo, downloads the dataset and preprocesses; EVERY
-# LATER run only `git pull`s the repo (refresh), skips the download + preprocessing
-# if already present, and skips training for any model whose checkpoint exists
-# (set FORCE_RETRAIN=1 to retrain).
+# It does EVERYTHING itself: git clone (branch 'uncertainty_spleen', sub-folder
+# 'my_unet-uncertainty/') -> deps -> download Spleen -> preprocess (axial orient +
+# body-crop + resize) -> for each fold train + test + calibrate + dump uncertainty
+# for the two models (baseline 'mcdropout' and train-time-calibrated 'mcdropout_cal')
+# -> print a Dice / ECE / temperature summary. Nothing morphological is used.
 #
-# GPU is used for train + test + uncertainty; the data loaders use WORKERS CPU
-# processes for augmentation/IO. Everything is overridable from the environment:
-#     FOLDS="0 1 2 3 4" WORKERS=8 BATCH=8 bash run_all_spleen.sh
+# You do NOT clone anything by hand -- this script clones for you. Put it on the VM
+# and launch it so it survives an SSH disconnect. Easiest bootstrap:
+#   curl -O https://raw.githubusercontent.com/ThanoSnake/my_unet/uncertainty_spleen/my_unet-uncertainty/run/run_all_spleen.sh
+#   nohup bash run_all_spleen.sh &        # progress: tail -f ~/spleen-run/run_*.log
+# In the morning copy off the VM:  ~/spleen-run/repo/my_unet-uncertainty/results/
 #
-set -euo pipefail
+# Assumes PyTorch (with CUDA) is already installed (standard on a Deep Learning VM);
+# everything else is pip-installed below. torch/numpy are NOT reinstalled.
 
-# ----------------------------- configuration ---------------------------------
-REPO_URL="${REPO_URL:-https://github.com/ThanoSnake/my_unet.git}"
-REPO_DIR="${REPO_DIR:-my_unet}"
-TASK="${TASK:-Task09_Spleen}"
-DATA_TAR_URL="${DATA_TAR_URL:-https://msd-for-monai.s3-us-west-2.amazonaws.com/Task09_Spleen.tar}"
+set -uo pipefail   # -u: error on unset vars; pipefail through tee. NOT -e: a 3am step
+                   # failure must not throw away the runs that already finished.
 
-FOLDS="${FOLDS:-0}"          # set to "0 1 2 3 4" for full 5-fold CV
-SIZE="${SIZE:-256}"          # preprocessing in-plane size (baked into the npy)
-PATCH="${PATCH:-256}"        # training/eval slice size (must be <= SIZE)
-BATCH="${BATCH:-8}"          # 256x256 fits batch 8 on an L4 with bf16 autocast
-WORKERS="${WORKERS:-8}"      # data-loader CPU workers (set 0 on a fork/CUDA error)
-EPOCHS="${EPOCHS:-150}"
-PATIENCE="${PATIENCE:-12}"
-DROPOUT="${DROPOUT:-0.4}"
-MC="${MC:-30}"               # MC stochastic passes T
-CALW="${CALW:-1.0}"          # lambda for the train-time SB-ECE term
-FGMARGIN="${FGMARGIN:-3}"    # empty axial slices kept around the organ (train)
-OUT_DIR="${OUT_DIR:-results}"
-PYTHON="${PYTHON:-python}"
+# ============================ CONFIG (edit these) ============================
+REPO_URL="https://github.com/ThanoSnake/my_unet.git"
+BRANCH="uncertainty_spleen"                 # branch that holds the *_spleen work
+PROJECT_SUBDIR="my_unet-uncertainty"        # sub-folder inside the repo
+WORKDIR="${WORKDIR:-$HOME/spleen-run}"      # where the repo + logs live
+TASK="Task09_Spleen"
+DATA_TAR_URL="https://msd-for-monai.s3-us-west-2.amazonaws.com/${TASK}.tar"
 
-# ----------------------------- clone (1st time) / pull (later) ---------------
-if [ -f "run_preprocessing_mc_spleen.py" ]; then
-    echo "==> already inside the repo: $(pwd)"
-    if [ "${SKIP_PULL:-0}" != "1" ]; then
-        echo "==> refreshing (git pull)"; git pull --ff-only || echo "   (pull skipped/failed; continuing)"
-    fi
-elif [ -d "$REPO_DIR" ]; then
-    echo "==> refreshing $REPO_DIR (git pull)"
-    git -C "$REPO_DIR" pull --ff-only || echo "   (pull skipped/failed; continuing)"
-    cd "$REPO_DIR"
+FOLDS="0"                                   # "0" tonight; "0 1 2 3 4" for full CV (much longer)
+
+# preprocessing / model / GPU knobs (L4 24GB)
+SIZE=256                  # preprocessing in-plane size (baked into the npy)
+PATCH=256                 # train/eval slice size (must be <= SIZE)
+BATCH=8                   # 256x256 fits batch 8 on an L4 (bf16); try 12/16 if no OOM, 4 if OOM
+WORKERS=8                 # data-loading processes; set 0 if you ever hit a CUDA-fork error
+EPOCHS=150
+PATIENCE=12
+DROPOUT=0.4
+MC=30                     # MC stochastic passes T
+CALW=1.0                  # lambda for the train-time SB-ECE term (try 5, 10 for a stronger prior)
+FGMARGIN=3                # empty axial slices kept around the organ (train balance)
+# ============================================================================
+
+mkdir -p "$WORKDIR"
+LOG="$WORKDIR/run_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1                 # log EVERYTHING (incl. clone) to console AND file
+
+echo "################ spleen uncertainty  $(date '+%F %T') ################"
+echo "repo=$REPO_URL  branch=$BRANCH  subdir=$PROJECT_SUBDIR  workdir=$WORKDIR"
+echo "task=$TASK folds='$FOLDS'  size=$SIZE patch=$PATCH batch=$BATCH workers=$WORKERS mc=$MC calw=$CALW"
+echo "log -> $LOG"
+
+run() {   # run() "label" cmd... : header + timing, CONTINUE on failure (overnight-safe)
+    local label="$1"; shift
+    echo ""; echo "===== [$(date '+%F %T')] $label ====="
+    local t0=$SECONDS
+    "$@"; local rc=$?
+    echo "----- $label done in $((SECONDS - t0))s (exit $rc) -----"
+    [ $rc -eq 0 ] || echo "!!! FAILED: $label (continuing) !!!"
+    return 0
+}
+
+# ---- 1. clone (or force-update) the repo on the uncertainty_spleen branch ----
+REPO_DIR="$WORKDIR/repo"
+if [ -d "$REPO_DIR/.git" ]; then
+    echo "repo present -> force-updating to origin/$BRANCH (tracked code only; data/ & results/ untouched)"
+    git -C "$REPO_DIR" fetch origin "$BRANCH" \
+        && git -C "$REPO_DIR" checkout "$BRANCH" \
+        && git -C "$REPO_DIR" reset --hard FETCH_HEAD \
+        || echo "WARN: could not update; using existing checkout"
 else
-    echo "==> cloning $REPO_URL"
-    git clone "$REPO_URL" "$REPO_DIR"
-    cd "$REPO_DIR"
+    git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$REPO_DIR" \
+        || { echo "git clone of branch '$BRANCH' failed -> aborting"; exit 1; }
 fi
-echo "==> working dir: $(pwd)"
+cd "$REPO_DIR/$PROJECT_SUBDIR" || { echo "cannot cd $REPO_DIR/$PROJECT_SUBDIR"; exit 1; }
+echo "on branch: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)  |  cwd: $(pwd)"
 
-# ----------------------------- python deps -----------------------------------
-# torch is intentionally omitted so the VM's pre-installed CUDA build is untouched.
-echo "==> installing python deps (keeping the pre-installed CUDA torch)"
-$PYTHON -m pip install --quiet --no-input \
-    medpy nibabel SimpleITK "batchgenerators==0.21" scipy scikit-image matplotlib pandas
-$PYTHON - <<'PY'
-import torch
-print("==> torch", torch.__version__, "| CUDA available:", torch.cuda.is_available(),
-      "|", (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"))
-PY
-# fail early & clearly if a core dep won't import (e.g. batchgenerators vs numpy)
-$PYTHON - <<'PY'
-import importlib
-for m in ("batchgenerators", "medpy", "nibabel", "scipy", "skimage", "matplotlib"):
-    importlib.import_module(m)
-print("==> core deps import OK")
-PY
+# sanity: the *_spleen files must actually be on this branch / sub-folder
+[ -f "run_preprocessing_mc_spleen.py" ] || {
+    echo "ERROR: run_preprocessing_mc_spleen.py not found in $(pwd)."
+    echo "       Push the *_spleen files to branch '$BRANCH' under '$PROJECT_SUBDIR/' first."
+    exit 1; }
 
-# ----------------------------- download dataset (1st time) -------------------
-mkdir -p data
-if [ ! -d "data/$TASK/imagesTr" ]; then
-    echo "==> downloading $TASK"
-    wget -c "$DATA_TAR_URL" -O "data/${TASK}.tar"
-    echo "==> extracting"
-    tar -xf "data/${TASK}.tar" -C data
-    find "data/$TASK" -name '._*' -delete 2>/dev/null || true
-else
-    echo "==> $TASK already present, skipping download"
-fi
-
-export TASK
-export DATA_DIR="$(pwd)/data/$TASK"
-echo "==> TASK=$TASK  DATA_DIR=$DATA_DIR"
-
-# ----------------------------- preprocessing (1st time) ----------------------
-if [ ! -f "$DATA_DIR/splits.pkl" ]; then
-    echo "==> preprocessing (axial orient + body-crop + resize ${SIZE})"
-    $PYTHON run_preprocessing_mc_spleen.py --size "$SIZE"
-else
-    echo "==> preprocessed data + splits present, skipping"
-fi
-
-mkdir -p "$OUT_DIR"
-
-# ----------------------------- experiments -----------------------------------
-common_eval="--patch-size $PATCH --batch-size $BATCH --num-workers $WORKERS --dropout-p $DROPOUT --out-dir $OUT_DIR"
-
-for f in $FOLDS; do
-    echo ""
-    echo "################  FOLD $f  ################"
-
-    # ---- A. baseline MC-Dropout (Dice + CE) ----
-    if [ "${FORCE_RETRAIN:-0}" = "1" ] || [ ! -f "$OUT_DIR/mcdropout_f${f}_best.pth" ]; then
-        echo "==> [A] train baseline mcdropout (fold $f)"
-        $PYTHON train_mc_spleen.py --fold "$f" --tag mcdropout \
-            --patch-size "$PATCH" --batch-size "$BATCH" --num-workers "$WORKERS" \
-            --epochs "$EPOCHS" --patience "$PATIENCE" --dropout-p "$DROPOUT" \
-            --fg-margin "$FGMARGIN" --out-dir "$OUT_DIR"
-    else
-        echo "==> [A] mcdropout f$f checkpoint exists -> skip training (FORCE_RETRAIN=1 to retrain)"
-    fi
-
-    echo "==> [A] test + uncertainty(raw) + temperature + uncertainty(+T)"
-    $PYTHON test_mc_spleen.py        --fold "$f" --tag mcdropout $common_eval
-    $PYTHON uncertainty_mc_spleen.py --fold "$f" --tag mcdropout $common_eval --mc-samples "$MC" --temperature 1.0 --save-volumes
-    $PYTHON calibrate_mc_spleen.py   --fold "$f" --tag mcdropout $common_eval
-    $PYTHON uncertainty_mc_spleen.py --fold "$f" --tag mcdropout $common_eval --mc-samples "$MC" --save-volumes
-
-    # ---- B. train-time calibrated MC-Dropout (Dice + CE + lambda*SB-ECE) ----
-    if [ "${FORCE_RETRAIN:-0}" = "1" ] || [ ! -f "$OUT_DIR/mcdropout_cal_f${f}_best.pth" ]; then
-        echo "==> [B] train calibrated mcdropout_cal (fold $f)"
-        $PYTHON train_mc_recalibrate_spleen.py --fold "$f" --tag mcdropout_cal \
-            --patch-size "$PATCH" --batch-size "$BATCH" --num-workers "$WORKERS" \
-            --epochs "$EPOCHS" --patience "$PATIENCE" --dropout-p "$DROPOUT" \
-            --cal-weight "$CALW" --fg-margin "$FGMARGIN" --out-dir "$OUT_DIR"
-    else
-        echo "==> [B] mcdropout_cal f$f checkpoint exists -> skip training (FORCE_RETRAIN=1 to retrain)"
-    fi
-
-    echo "==> [B] test + uncertainty(raw) + temperature + uncertainty(+T)"
-    $PYTHON test_mc_spleen.py        --fold "$f" --tag mcdropout_cal $common_eval
-    $PYTHON uncertainty_mc_spleen.py --fold "$f" --tag mcdropout_cal $common_eval --mc-samples "$MC" --temperature 1.0 --save-volumes
-    $PYTHON calibrate_mc_spleen.py   --fold "$f" --tag mcdropout_cal $common_eval
-    $PYTHON uncertainty_mc_spleen.py --fold "$f" --tag mcdropout_cal $common_eval --mc-samples "$MC" --save-volumes
+# ---- 2. package dirs need __init__.py (may be .gitignored -> recreate; harmless if present) ----
+for d in datasets datasets/two_dim datasets/three_dim networks loss_functions evaluation utilities; do
+    mkdir -p "$d"; touch "$d/__init__.py"
 done
 
-# ----------------------------- summary ---------------------------------------
-echo ""
-echo "==> summary: Dice, and foreground/macro ECE + temperature T across the four settings"
-OUT_DIR="$OUT_DIR" FOLDS="$FOLDS" $PYTHON - <<'PY'
+# ---- 3. dependencies (torch/numpy assumed preinstalled on the DL VM -> NOT reinstalled) ----
+echo ""; echo "===== [$(date '+%F %T')] pip install deps ====="
+PKGS="medpy nibabel SimpleITK batchgenerators==0.21 scipy scikit-image matplotlib pandas"
+python3 -m pip install --break-system-packages $PKGS 2>/dev/null || python3 -m pip install $PKGS || \
+    echo "WARN: pip install returned non-zero; continuing (deps may already be present)"
+
+# fail early & clearly if a core dep won't import (e.g. batchgenerators vs numpy 2.x)
+python3 - <<'PY' || { echo "FATAL: core deps import failed (see above). Try: pip install 'numpy<2'  then re-run."; exit 1; }
+import torch, importlib
+for m in ("batchgenerators", "medpy", "nibabel", "scipy", "skimage", "matplotlib"):
+    importlib.import_module(m)
+print("torch", torch.__version__, "| CUDA available:", torch.cuda.is_available(),
+      "|", (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"))
+print("core deps import OK")
+PY
+
+# ---- 4. data: reuse if already preprocessed, else download + preprocess ----
+export TASK
+export DATA_DIR="$PWD/data/$TASK"
+PREP_DIR="$DATA_DIR/preprocessed"
+SPLITS="$DATA_DIR/splits.pkl"
+
+have_prep() {   # true only if splits + a >=2-channel npy (image+label) exist
+    [ -f "$SPLITS" ] || return 1
+    local f
+    f=$(find "$PREP_DIR" -maxdepth 1 -name '*.npy' -print -quit 2>/dev/null)
+    [ -n "$f" ] || return 1
+    python3 - "$f" <<'PY'
+import sys, numpy as np
+sys.exit(0 if np.load(sys.argv[1], mmap_mode="r").shape[0] >= 2 else 1)
+PY
+}
+
+if have_prep; then
+    echo "preprocessed data (>=2 channels) + splits present -> skipping download/preprocess"
+else
+    if [ ! -d "$DATA_DIR/imagesTr" ]; then
+        echo ""; echo "===== [$(date '+%F %T')] download raw $TASK (~1.5 GB) ====="
+        mkdir -p data
+        ( cd data && curl -O "$DATA_TAR_URL" && tar -xf "${TASK}.tar" ) \
+            || { echo "DOWNLOAD FAILED -> aborting"; exit 1; }
+    fi
+    run "preprocess (axial orient + body-crop + resize $SIZE)" python3 run_preprocessing_mc_spleen.py --size "$SIZE"
+    have_prep || { echo "PREPROCESS did not produce a 2-channel npy + splits -> aborting"; exit 1; }
+fi
+
+# shared eval args for test / uncertainty / calibrate
+EVAL="--patch-size $PATCH --batch-size $BATCH --num-workers $WORKERS --dropout-p $DROPOUT --out-dir results"
+
+# ---- 5. experiments: per fold, both models. skip-if-exists makes re-runs idempotent ----
+for FOLD in $FOLDS; do
+    echo ""; echo "################  FOLD $FOLD  ################"
+
+    # ===== A. baseline MC-Dropout (Dice + CE) =====
+    if [ -f "results/mcdropout_f${FOLD}_best.pth" ]; then
+        echo "===== skip train mcdropout f$FOLD (best.pth already exists) ====="
+    else
+        run "train mcdropout f$FOLD" python3 train_mc_spleen.py --fold "$FOLD" --tag mcdropout \
+            --patch-size "$PATCH" --batch-size "$BATCH" --num-workers "$WORKERS" \
+            --epochs "$EPOCHS" --patience "$PATIENCE" --dropout-p "$DROPOUT" \
+            --fg-margin "$FGMARGIN" --out-dir results
+    fi
+    run "test mcdropout f$FOLD"             python3 test_mc_spleen.py        --fold "$FOLD" --tag mcdropout $EVAL
+    run "uncertainty raw mcdropout f$FOLD"  python3 uncertainty_mc_spleen.py --fold "$FOLD" --tag mcdropout $EVAL --mc-samples "$MC" --temperature 1.0 --save-volumes
+    run "calibrate mcdropout f$FOLD"        python3 calibrate_mc_spleen.py   --fold "$FOLD" --tag mcdropout $EVAL
+    run "uncertainty +T mcdropout f$FOLD"   python3 uncertainty_mc_spleen.py --fold "$FOLD" --tag mcdropout $EVAL --mc-samples "$MC" --save-volumes
+
+    # ===== B. train-time calibrated MC-Dropout (Dice + CE + lambda*SB-ECE) =====
+    if [ -f "results/mcdropout_cal_f${FOLD}_best.pth" ]; then
+        echo "===== skip train mcdropout_cal f$FOLD (best.pth already exists) ====="
+    else
+        run "train mcdropout_cal f$FOLD" python3 train_mc_recalibrate_spleen.py --fold "$FOLD" --tag mcdropout_cal \
+            --patch-size "$PATCH" --batch-size "$BATCH" --num-workers "$WORKERS" \
+            --epochs "$EPOCHS" --patience "$PATIENCE" --dropout-p "$DROPOUT" \
+            --cal-weight "$CALW" --fg-margin "$FGMARGIN" --out-dir results
+    fi
+    run "test mcdropout_cal f$FOLD"             python3 test_mc_spleen.py        --fold "$FOLD" --tag mcdropout_cal $EVAL
+    run "uncertainty raw mcdropout_cal f$FOLD"  python3 uncertainty_mc_spleen.py --fold "$FOLD" --tag mcdropout_cal $EVAL --mc-samples "$MC" --temperature 1.0 --save-volumes
+    run "calibrate mcdropout_cal f$FOLD"        python3 calibrate_mc_spleen.py   --fold "$FOLD" --tag mcdropout_cal $EVAL
+    run "uncertainty +T mcdropout_cal f$FOLD"   python3 uncertainty_mc_spleen.py --fold "$FOLD" --tag mcdropout_cal $EVAL --mc-samples "$MC" --save-volumes
+done
+
+# ---- 6. summary: Dice + foreground/macro ECE + temperature across the four settings ----
+echo ""; echo "===== [$(date '+%F %T')] summary ====="
+OUT_DIR="results" FOLDS="$FOLDS" python3 - <<'PY' || echo "WARN: summary failed"
 import os, json
 out_dir = os.environ.get("OUT_DIR", "results")
 folds = os.environ.get("FOLDS", "0").split()
@@ -183,5 +214,10 @@ for f in folds:
             print(f"{label:<26}{r[0]:>9.4f}{macro:>11}{r[2]:>7.3f}")
 PY
 
+cp "$LOG" results/ 2>/dev/null || true       # keep a copy of the log next to the results
+echo ""; echo "################ ALL DONE  $(date '+%F %T') ################"
+echo "results in: $REPO_DIR/$PROJECT_SUBDIR/results/"
+ls -1 results/ 2>/dev/null | sed 's/^/  /'
 echo ""
-echo "==> DONE. Weights + *_scores.json in $OUT_DIR/ ; panels, reliability diagrams and *_uncertainty.json in $OUT_DIR/uncertainty/"
+echo "Copy off the VM, e.g.:"
+echo "  gcloud compute scp --recurse <user>@<vm>:$REPO_DIR/$PROJECT_SUBDIR/results ./"
