@@ -32,7 +32,9 @@ def main():
     p.add_argument("--tag", default="mcdropout")
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--patience", type=int, default=12)
+    p.add_argument("--patience", type=int, default=15,
+                   help="early-stop patience; a bit high because the val loss is noisy "
+                        "(all-slice val mixes many empty slices with the few organ ones)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=8,
                    help="8 fits 256x256 comfortably on an L4 (bf16 autocast); raise if memory allows")

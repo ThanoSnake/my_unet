@@ -70,7 +70,9 @@ def main():
     p.add_argument("--tag", default="mcdropout_cal")
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--patience", type=int, default=12)
+    p.add_argument("--patience", type=int, default=15,
+                   help="early-stop patience; a bit high because the val loss is noisy "
+                        "(all-slice val mixes many empty slices with the few organ ones)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=256)
@@ -80,8 +82,9 @@ def main():
                    help="CPU workers for augmentation; 0 if you hit a fork/CUDA error")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--dropout-p", type=float, default=0.4)
-    p.add_argument("--cal-weight", type=float, default=1.0,
-                   help="lambda for the SB-ECE term (Dice+CE+lambda*SB-ECE); try 1, 5, 10")
+    p.add_argument("--cal-weight", type=float, default=0.2,
+                   help="lambda for the SB-ECE term (Dice+CE+lambda*SB-ECE). 1.0 over-softens the "
+                        "whole organ (foreground entropy blows up); 0.2 nudges gently. Sweep 0.1-0.5.")
     p.add_argument("--cal-bins", type=int, default=15)
     p.add_argument("--num-classes", type=int, default=config.NUM_CLASSES)
     p.add_argument("--out-dir", default=os.path.join(config.PROJECT_ROOT, "results"))

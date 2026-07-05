@@ -36,8 +36,9 @@ from mc_common_spleen import build_plain_loaders_spleen, pick_device
 from networks.UNET_mc import MCDropoutUNet
 from utilities.mc_dropout import (
     enable_dropout, mc_forward, uncertainty_maps,
-    SegCalibration, save_uncertainty_png, save_calibration_figure,
+    save_uncertainty_png, save_calibration_figure,
 )
+from utilities.mc_dropout_spleen import SegCalibrationSpleen
 
 
 def main():
@@ -97,7 +98,7 @@ def main():
 
     # slices are streamed in, grouped per case (volume), then restacked
     store = defaultdict(lambda: defaultdict(list))
-    calib = SegCalibration(args.num_classes, n_bins=15)
+    calib = SegCalibrationSpleen(args.num_classes, n_bins=15)   # per-class over pred==c (no FN artifact)
 
     with torch.no_grad():
         for batch in test_loader:

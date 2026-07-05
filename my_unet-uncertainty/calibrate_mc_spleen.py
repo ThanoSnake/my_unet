@@ -22,7 +22,7 @@ import torch
 import config
 from mc_common_spleen import build_plain_loaders_spleen, pick_device
 from networks.UNET_mc import MCDropoutUNet
-from utilities.mc_dropout import fit_temperature
+from utilities.mc_dropout_spleen import fit_temperature_safe
 
 
 def main():
@@ -51,40 +51,47 @@ def main():
     model.load_state_dict(torch.load(ckpt, map_location=device))
     model.eval()   # dropout OFF -> deterministic logits for a stable T fit
 
-    # collect foreground logits + labels over the validation fold
+    # collect GT-foreground logits + labels over the validation fold. gt>0 (NOT
+    # gt>0|pred>0) so the fit set does NOT depend on the model's own predictions:
+    # otherwise a model that over-/mis-segments fills the ROI with its own confident
+    # errors and the temperature runs away to infinity (the all-0.5 collapse).
     logits_fg, targets_fg = [], []
     with torch.no_grad():
         for batch in val_loader:
             data = batch["data"][0].float().to(device)
             gt = batch["seg"][0].long().to(device)[:, 0]        # [b, H, W]
             logits = model(data)                                # [b, C, H, W]
-            pred = logits.argmax(dim=1)
-            mask = (gt > 0) | (pred > 0)                        # foreground ROI
+            mask = gt > 0                                       # GT foreground only
             if mask.any():
                 logits_fg.append(logits.permute(0, 2, 3, 1)[mask].cpu())  # [N, C]
                 targets_fg.append(gt[mask].cpu())               # [N]
 
     if not logits_fg:
-        raise SystemExit("no foreground pixels found in the val fold")
+        raise SystemExit("no GT-foreground pixels found in the val fold")
     logits_fg = torch.cat(logits_fg).float()
     targets_fg = torch.cat(targets_fg).long()
 
-    temperature = fit_temperature(logits_fg, targets_fg)
+    # fit + safety rail: T is clamped to [0.5, 10]; a pathological optimum outside
+    # that range falls back to T=1.0 (raw uncertainty kept) instead of collapsing to 0.5
+    temperature, accepted = fit_temperature_safe(logits_fg, targets_fg)
 
     os.makedirs(args.out_dir, exist_ok=True)
     out = {
         "tag": args.tag, "fold": args.fold,
         "temperature": temperature,
+        "accepted": accepted,
         "n_foreground_pixels": int(targets_fg.numel()),
-        "fit_on": "val foreground (gt>0 | pred>0), deterministic logits",
+        "fit_on": "val GT foreground (gt>0), deterministic logits; T in [0.5,10] else fallback 1.0",
     }
     path = os.path.join(args.out_dir, f"{stem}_temperature.json")
     with open(path, "w") as f:
         json.dump(out, f, indent=2)
 
-    print(f"[{stem}] fitted temperature T={temperature:.4f} "
-          f"on {targets_fg.numel()} foreground pixels -> {path}")
-    if temperature > 1:
+    print(f"[{stem}] temperature T={temperature:.4f} "
+          f"on {targets_fg.numel()} GT-foreground pixels -> {path}")
+    if not accepted:
+        print(f"[{stem}] fell back to T=1.0 -> no post-hoc rescale applied (raw uncertainty kept)")
+    elif temperature > 1:
         print(f"[{stem}] T>1 -> model was over-confident; softmax will be softened")
     elif temperature < 1:
         print(f"[{stem}] T<1 -> model was under-confident; softmax will be sharpened")

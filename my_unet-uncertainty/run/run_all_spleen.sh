@@ -39,10 +39,11 @@ WORKERS="${WORKERS:-8}"   # workers for the (expensive) TRAIN augmentation only;
                           # single-process, so a second forked pool never aborts CUDA. If the
                           # TRAIN pool itself ever aborts workers, drop to WORKERS=0.
 EPOCHS=150
-PATIENCE=12
+PATIENCE=15               # a bit high: the all-slice val loss is noisy (many empty slices)
 DROPOUT=0.4
 MC=30                     # MC stochastic passes T
-CALW=1.0                  # lambda for the train-time SB-ECE term (try 5, 10 for a stronger prior)
+CALW="${CALW:-0.2}"       # lambda for the train-time SB-ECE term. 1.0 over-softened the whole
+                          # organ (foreground entropy blew up); 0.2 nudges gently. Sweep 0.1-0.5.
 FGMARGIN=3                # empty axial slices kept around the organ (train balance)
 # ============================================================================
 
