@@ -30,6 +30,7 @@ from multiprocessing import Pool
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy import ndimage
 
 import config
 from datasets.two_dim.NumpyDataLoader_loss import NumpyDataSet
@@ -161,21 +162,38 @@ def run_val_dice(model, loader, device, num_classes):
 
 
 #
-# test: full-slice inference per case -> Dice + ASSD.
-#
-# We compute ONLY Dice + ASSD (the two target metrics) and PARALLELISE the metric
-# computation across cases. The default evaluator also computes exact Hausdorff /
-# HD95 / ASD, and does it sequentially -- on full-resolution HepaticVessel (huge
-# vessel surface) that took *hours* for a single fold. Dice + ASSD, spread over the
-# CPU cores, brings it down to minutes. (Add more metrics here later if you want.)
+# test: full-slice inference per case -> Dice + ASSD, with optional connected-component
+# post-processing. We compute ONLY Dice + ASSD (the two target metrics) and PARALLELISE the
+# metric computation across cases (the default evaluator's exact Hausdorff/HD95/ASD, computed
+# sequentially, took *hours* on full-res HepaticVessel). If a pp path + min size are given, we
+# ALSO evaluate a post-processed prediction and write it to a SEPARATE file, so you get metrics
+# BEFORE and AFTER post-processing from a single inference pass.
 #
 _TEST_METRICS = ["Dice"]
 _TEST_ADVANCED = ["Avg. Symmetric Surface Distance"]
 
 
+def remove_small_components(pred, num_classes, min_size):
+    """Remove 3D connected components smaller than `min_size` voxels, per foreground class.
+    pred: [Z, H, W] integer label map. Cleans spurious speckle / far-off false positives."""
+    out = pred.copy()
+    for c in range(1, num_classes):
+        mask = pred == c
+        if not mask.any():
+            continue
+        lbl, n = ndimage.label(mask)                 # 3D connected components
+        sizes = np.bincount(lbl.ravel())
+        drop = sizes < min_size
+        drop[0] = False                              # never remove the label-array background
+        out[drop[lbl]] = 0
+    return out
+
+
 def _eval_one(payload):
-    """Dice + ASSD for ONE (pred, gt) case. Module-level so multiprocessing can pickle it."""
-    pred, gt, labels = payload
+    """Dice + ASSD for ONE case (optionally post-processed). Module-level -> picklable by Pool."""
+    pred, gt, labels, pp_min_size = payload
+    if pp_min_size and pp_min_size > 0:
+        pred = remove_small_components(pred, config.NUM_CLASSES, pp_min_size)
     ev = Evaluator(labels=labels, metrics=list(_TEST_METRICS), advanced_metrics=list(_TEST_ADVANCED))
     ev.set_test(pred)
     ev.set_reference(gt)
@@ -183,7 +201,18 @@ def _eval_one(payload):
     return {lab: {m: float(v) for m, v in md.items()} for lab, md in res.items()}
 
 
-def evaluate_test(model, loader, device, json_path, metric_workers=None):
+def _aggregate(per_case):
+    """nanmean over cases -> {label: {metric: value}}, matching the JSON the existing tools read."""
+    acc = {}
+    for case in per_case:
+        for lab, md in case.items():
+            acc.setdefault(lab, {})
+            for m, v in md.items():
+                acc[lab].setdefault(m, []).append(v)
+    return {lab: {m: float(np.nanmean(vs)) for m, vs in md.items()} for lab, md in acc.items()}
+
+
+def evaluate_test(model, loader, device, json_path, pp_json_path=None, pp_min_size=0, metric_workers=None):
     model.eval()
     # accumulate per-case pred/GT as uint8 (labels are small ints) to keep RAM bounded on large CT
     pred_dict, gt_dict = defaultdict(list), defaultdict(list)
@@ -195,27 +224,24 @@ def evaluate_test(model, loader, device, json_path, metric_workers=None):
             for i, fname in enumerate(batch["fnames"]):
                 pred_dict[fname[0]].append(pred[i])
                 gt_dict[fname[0]].append(target[i])
-    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k]), config.LABELS) for k in pred_dict]  # each [Z,H,W]
+    base = [(np.stack(pred_dict[k]), np.stack(gt_dict[k]), config.LABELS) for k in pred_dict]  # each [Z,H,W]
 
-    # metric computation is the bottleneck on full-res vessels -> parallelise across cases
-    nproc = min(len(pairs), metric_workers or (os.cpu_count() or 1)) if pairs else 1
-    print(f"[eval] {len(pairs)} test cases -> Dice + ASSD on {nproc} process(es)", flush=True)
-    if nproc > 1:
-        with Pool(nproc) as pool:
-            per_case = pool.map(_eval_one, pairs)
-    else:
-        per_case = [_eval_one(p) for p in pairs]
+    def _run(min_size, path):
+        pairs = [(p, g, lab, min_size) for (p, g, lab) in base]
+        nproc = min(len(pairs), metric_workers or (os.cpu_count() or 1)) if pairs else 1
+        kind = "raw" if not min_size else f"pp<{min_size}vox"
+        print(f"[eval] {len(pairs)} cases -> Dice + ASSD [{kind}] on {nproc} process(es)", flush=True)
+        if nproc > 1:
+            with Pool(nproc) as pool:
+                per_case = pool.map(_eval_one, pairs)
+        else:
+            per_case = [_eval_one(p) for p in pairs]
+        mean = _aggregate(per_case)
+        with open(path, "w") as f:
+            json.dump({"task": config.TASK, "results": {"all": per_case, "mean": mean}}, f, indent=2)
+        return mean
 
-    # aggregate (nanmean over cases), matching the JSON the existing tools read
-    acc = {}
-    for case in per_case:
-        for lab, md in case.items():
-            acc.setdefault(lab, {})
-            for m, v in md.items():
-                acc[lab].setdefault(m, []).append(v)
-    mean = {lab: {m: float(np.nanmean(vs)) for m, vs in md.items()} for lab, md in acc.items()}
-
-    out = {"task": config.TASK, "results": {"all": per_case, "mean": mean}}
-    with open(json_path, "w") as f:
-        json.dump(out, f, indent=2)
-    return {"mean": mean}
+    raw_mean = _run(0, json_path)                              # BEFORE post-processing
+    if pp_json_path and pp_min_size and pp_min_size > 0:
+        _run(pp_min_size, pp_json_path)                       # AFTER post-processing (same inference)
+    return {"mean": raw_mean}

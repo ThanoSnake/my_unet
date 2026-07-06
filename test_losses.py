@@ -35,6 +35,10 @@ def main():
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--fg-fraction", type=float, default=0.0)
     p.add_argument("--num-classes", type=int, default=config.NUM_CLASSES)
+    p.add_argument("--pp-min-size", type=int, default=0,
+                   help="post-processing: remove 3D connected components smaller than this many voxels "
+                        "(0 = off). Writes a SEPARATE <tag>_pp_f<fold>_scores.json (metrics AFTER post-proc) "
+                        "next to the raw one (metrics BEFORE).")
     p.add_argument("--out-dir", default=os.path.join(config.PROJECT_ROOT, "results"))
     p.add_argument("--ckpt", default=None, help="checkpoint path (default <out-dir>/<tag>_f<fold>_best.pth)")
     args = p.parse_args()
@@ -54,10 +58,15 @@ def main():
     print(f"[{stem}] loaded {ckpt}  (full-slice deterministic Dice/ASSD)")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    json_path = os.path.join(args.out_dir, f"{stem}_scores.json")
-    scores = evaluate_test(model, test_loader, device, json_path)
+    json_path = os.path.join(args.out_dir, f"{stem}_scores.json")                       # BEFORE post-proc
+    pp_json_path = (os.path.join(args.out_dir, f"{args.tag}_pp_f{args.fold}_scores.json")
+                    if args.pp_min_size > 0 else None)                                  # AFTER post-proc
+    scores = evaluate_test(model, test_loader, device, json_path,
+                           pp_json_path=pp_json_path, pp_min_size=args.pp_min_size)
 
-    print(f"[{stem}] scores -> {json_path}")
+    print(f"[{stem}] raw scores -> {json_path}")
+    if pp_json_path:
+        print(f"[{stem}] post-processed (min_size={args.pp_min_size}) scores -> {pp_json_path}")
     for label, md in scores["mean"].items():
         print(f"  label {label}: Dice={md.get('Dice')} "
               f"ASSD={md.get('Avg. Symmetric Surface Distance')}")

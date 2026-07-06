@@ -3,10 +3,11 @@
 # Self-contained overnight loss-experiment on Task08 HepaticVessel (GPU VM, e.g. L4).
 #
 # It does EVERYTHING itself: git clone (branch 'losses') -> deps -> download data ->
-# preprocess (boundary SDF, float16) -> train + test the 3 loss combos -> compare.
-# Trained weights (<tag>_f<fold>_best.pth), scores (<tag>_f<fold>_scores.json),
-# learning curves (<tag>_f<fold>_train.json) and the full log all land in
-# <WORKDIR>/repo/results/ .
+# preprocess (boundary SDF, float16) -> 5-fold train + test (baseline + Focal-Tversky+Boundary)
+# -> compare, BEFORE and AFTER connected-component post-processing.
+# Trained weights (<tag>_f<fold>_best.pth), raw scores (<tag>_f<fold>_scores.json),
+# post-processed scores (<tag>_pp_f<fold>_scores.json), learning curves
+# (<tag>_f<fold>_train.json) and the full log all land in <WORKDIR>/repo/results/ .
 #
 # You do NOT need to clone anything by hand -- this script clones for you.
 # Put this file on the VM and launch it so it survives an SSH disconnect:
@@ -25,8 +26,9 @@ BRANCH="losses"                                         # <-- the branch to run
 WORKDIR="${WORKDIR:-$HOME/losses-run}"                  # where the repo + logs live
 TASK="Task08_HepaticVessel"
 
-FOLDS="0"                                               # "0" tonight; "0 1 2 3 4" for full CV (much longer)
-LOSSES="dice_ce ftversky_ce_boundary cldice_dice_ce"   # baseline + Combo 1 + Combo 2
+FOLDS="0 1 2 3 4"                                       # full 5-fold CV for statistical confidence
+LOSSES="dice_ce ftversky_ce_boundary"                  # baseline + Combo 1 (clDice dropped: no benefit in 2D-sliced 3D vessels)
+PP_MIN_SIZE=50                                          # post-proc: drop 3D components < this many voxels (tunable; 0 = off)
 
 # training budget / GPU knobs (L4 24GB)
 EPOCHS=400
@@ -139,25 +141,31 @@ for FOLD in $FOLDS; do
   done
 done
 
-# ---- 6. TEST all combos (fast: Dice + ASSD only, parallel across cases) ----
+# ---- 6. TEST all combos: writes raw (<tag>_f#) AND post-processed (<tag>_pp_f#) scores ----
+#         re-tests if EITHER file is missing (so fold 0, tested before we added pp, gets its pp file).
 for FOLD in $FOLDS; do
   for LOSS in $LOSSES; do
-    if [ -f "results/${LOSS}_f${FOLD}_scores.json" ]; then
-        echo "===== skip test $LOSS fold$FOLD (scores.json already exists) ====="
+    if [ -f "results/${LOSS}_f${FOLD}_scores.json" ] && [ -f "results/${LOSS}_pp_f${FOLD}_scores.json" ]; then
+        echo "===== skip test $LOSS fold$FOLD (raw + pp scores already exist) ====="
     else
         run "test $LOSS fold$FOLD" python3 test_losses.py --tag "$LOSS" --fold "$FOLD" \
-            --num-workers "$WORKERS" --out-dir results
+            --num-workers "$WORKERS" --pp-min-size "$PP_MIN_SIZE" --out-dir results
     fi
   done
 done
 
-# ---- 7. aggregate + compare (Dice / ASSD per class, delta vs the dice_ce baseline) ----
+# ---- 7. aggregate + compare, BEFORE (raw) and AFTER (pp) post-processing ----
 for LOSS in $LOSSES; do
-    run "fold-mean $LOSS" python3 train_eval.py --fold-mean "$LOSS"
+    run "fold-mean $LOSS (raw)"      python3 train_eval.py --fold-mean "$LOSS"
+    run "fold-mean ${LOSS}_pp (pp)"  python3 train_eval.py --fold-mean "${LOSS}_pp"
 done
-MEAN_FILES=""
-for LOSS in $LOSSES; do MEAN_FILES="$MEAN_FILES ${LOSS}_mean_scores.json"; done
-run "compare" python3 train_eval.py --compare $MEAN_FILES
+RAW_FILES=""; PP_FILES=""
+for LOSS in $LOSSES; do
+    RAW_FILES="$RAW_FILES ${LOSS}_mean_scores.json"
+    PP_FILES="$PP_FILES ${LOSS}_pp_mean_scores.json"
+done
+run "compare RAW (before post-proc)"   python3 train_eval.py --compare $RAW_FILES
+run "compare POST-PROC (after)"        python3 train_eval.py --compare $PP_FILES
 
 cp "$LOG" results/ 2>/dev/null || true       # keep a copy of the log next to the results
 echo ""; echo "################ ALL DONE  $(date '+%F %T') ################"
